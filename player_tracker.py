@@ -13,7 +13,9 @@ Setup:
   python player_tracker.py
 """
 
+import functools
 import os
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -21,9 +23,21 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
 
+# Make every print show up in hosting logs immediately.
+print = functools.partial(print, flush=True)
+
+
+def _place_id_from_env() -> int:
+    # Accepts a plain number or a full game link like
+    # https://www.roblox.com/games/123456789/My-Game
+    raw = os.getenv("PLACE_ID", "").strip()
+    m = re.search(r"games/(\d+)", raw) or re.fullmatch(r"(\d+)", raw)
+    return int(m.group(1)) if m else 0
+
+
 # ---------------- CONFIG ----------------
-"https://discord.com/api/webhooks/1559026962301718608/FfCq30DI0h_PmOcsCfzPZ5KNE0GqfwUU7jU_mx4Y79wFAUIllplnFesQDc11I6yTkPg4")
-PLACE_ID = int(os.getenv("PLACE_ID", "136916813907652"))  # number in the game URL: roblox.com/games/<PLACE_ID>/...
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "PASTE_YOUR_WEBHOOK_URL_HERE").strip()
+PLACE_ID = _place_id_from_env()  # number in the game URL: roblox.com/games/<PLACE_ID>/...
 THRESHOLD = 10          # ping @everyone when players >= this
 RESET_BELOW = 8         # re-arm the ping once players drop to this or lower
 POLL_SECONDS = 60       # how often to check (don't go much lower than 30)
@@ -123,10 +137,37 @@ def save_message_id(message_id: str) -> None:
 def main() -> None:
     start_web_if_needed()
 
-    if "PASTE_YOUR" in WEBHOOK_URL or PLACE_ID == 0:
-        raise SystemExit("Set WEBHOOK_URL and PLACE_ID first.")
+    problems = []
+    if not re.match(r"https://(ptb\.|canary\.)?discord(app)?\.com/api/webhooks/\d+/\S+$", WEBHOOK_URL):
+        problems.append(
+            "WEBHOOK_URL is missing or isn't a Discord webhook link "
+            "(it should start with https://discord.com/api/webhooks/)."
+        )
+    if PLACE_ID == 0:
+        problems.append(
+            f"PLACE_ID is missing or unreadable (got {os.getenv('PLACE_ID')!r}). "
+            "Use the number from your game link: roblox.com/games/<number>/..."
+        )
+    if problems:
+        for p in problems:
+            print("CONFIG ERROR:", p)
+        print("Fix these in your host's environment variables, then redeploy.")
+        raise SystemExit(1)
 
-    universe_id = get_universe_id(PLACE_ID)
+    # Look up the game, retrying instead of crashing if Roblox is slow or busy.
+    while True:
+        try:
+            universe_id = get_universe_id(PLACE_ID)
+            break
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code in (400, 404):
+                print(f"CONFIG ERROR: Roblox says place {PLACE_ID} doesn't exist. Check PLACE_ID.")
+                raise SystemExit(1)
+            print(f"Couldn't reach Roblox yet ({e}). Retrying in 30s...")
+        except (requests.RequestException, KeyError, ValueError) as e:
+            print(f"Couldn't reach Roblox yet ({e}). Retrying in 30s...")
+        time.sleep(30)
+
     print(f"Tracking place {PLACE_ID} (universe {universe_id})")
 
     status_id = load_message_id()
@@ -167,6 +208,10 @@ def main() -> None:
             print(f"Unexpected response from Roblox: {e}")
 
         time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
